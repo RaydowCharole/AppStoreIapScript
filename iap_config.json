@@ -1,0 +1,10 @@
+{
+  "key_id": "YOUR_KEY_ID",
+  "issuer_id": "YOUR_ISSUER_ID",
+  "app_id": "YOUR_APP_ID",
+  "product_id_prefix": "IAP_PREFIX",
+  "prices": [
+    0.99,
+    1.99
+  ]
+}

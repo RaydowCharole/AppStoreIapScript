@@ -1,0 +1,25 @@
+#!/bin/zsh
+
+echo "🔧 运行前准备检查"
+echo "=================="
+echo ""
+echo "⚠️  请确认以下文件已准备就绪："
+echo ""
+echo "1️⃣  配置文件：iap_config.json"
+echo "   - 包含 key_id, issuer_id, app_id, product_id_prefix, prices"
+echo ""
+echo "2️⃣  API密钥文件：AuthKey_[key_id].p8"
+echo "   - 放在与脚本同目录下"
+echo ""
+echo "3️⃣  审核截图：review.png"
+echo "   - 放在与脚本同目录下"
+echo ""
+echo "=================="
+echo ""
+echo "⚠️ 确认以上文件都已准备好再继续..."
+echo ""
+echo "📦 安装依赖..."
+sudo bundle install
+echo ""
+echo "🚀 开始执行脚本..."
+ruby create_iap.rb
