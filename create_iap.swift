@@ -2,10 +2,6 @@
 import Foundation
 import CryptoKit
 
-// CSV 列：Product ID, Reference Name, Display Name, Description, Price, Screenshot
-// 本地化固定 en-US
-// JSON：Key ID, Issuer ID, Apple ID
-
 struct ScriptError: Error {
     let message: String
 
@@ -14,9 +10,24 @@ struct ScriptError: Error {
     }
 }
 
+struct APIHTTPError: Error {
+    let statusCode: Int
+    let body: String
+    let json: [String: Any]
+
+    init(statusCode: Int, data: Data) {
+        self.statusCode = statusCode
+        self.body = String(data: data, encoding: .utf8) ?? ""
+        self.json = (try? jsonObject(data)) ?? [:]
+    }
+}
+
 func errorMessage(_ error: Error) -> String {
     if let scriptError = error as? ScriptError {
         return scriptError.message
+    }
+    if let apiError = error as? APIHTTPError {
+        return "HTTP \(apiError.statusCode): \(apiError.body)"
     }
     return String(reflecting: error)
 }
@@ -492,6 +503,34 @@ class AppStoreConnectAPI {
         let fileName = imageURL.lastPathComponent
         let md5Hash = Insecure.MD5.hash(data: fileData).map { String(format: "%02x", $0) }.joined()
 
+        if let existing = try await fetchReviewScreenshot(inAppPurchaseID: inAppPurchaseID),
+           let existingID = (existing["data"] as? [String: Any])?["id"] as? String {
+            let attributes = (existing["data"] as? [String: Any])?["attributes"] as? [String: Any] ?? [:]
+            let checksum = (attributes["sourceFileChecksum"] as? String ?? "").lowercased()
+            let state = assetDeliveryState(from: attributes)
+            let operations = attributes["uploadOperations"] as? [[String: Any]] ?? []
+            let existingSize = (attributes["fileSize"] as? NSNumber)?.intValue
+
+            if checksum == md5Hash && (state == "UPLOAD_COMPLETE" || state == "COMPLETE") {
+                print("截图未变化（\(state)），跳过上传")
+                print("✅ 截图已是最新")
+                return existingID
+            }
+
+            if !operations.isEmpty && (existingSize == nil || existingSize == fileData.count) {
+                print("复用未完成的截图预留: \(existingID)")
+                return try await finishScreenshotUpload(
+                    screenshotID: existingID,
+                    operations: operations,
+                    imageURL: imageURL,
+                    md5Hash: md5Hash
+                )
+            }
+
+            print("删除现有截图并按最新文件重新上传...")
+            _ = try await apiRequest(path: "/v1/inAppPurchaseAppStoreReviewScreenshots/\(existingID)", method: "DELETE")
+        }
+
         print("步骤1: 创建截图预留...")
         let reservation = try await createScreenshotReservation(
             inAppPurchaseID: inAppPurchaseID,
@@ -499,62 +538,72 @@ class AppStoreConnectAPI {
             fileSize: fileData.count
         )
         guard let data = reservation["data"] as? [String: Any],
-              let screenshotID = data["id"] as? String,
-              let attributes = data["attributes"] as? [String: Any],
-              let operations = attributes["uploadOperations"] as? [[String: Any]] else {
-            throw ScriptError("截图预留响应缺少 uploadOperations")
+              let screenshotID = data["id"] as? String else {
+            throw ScriptError("截图预留响应缺少 id")
         }
+        let attributes = data["attributes"] as? [String: Any] ?? [:]
+        let state = assetDeliveryState(from: attributes)
         print("截图ID: \(screenshotID)")
 
-        print("步骤2: 上传文件数据...")
-        try await uploadFileData(operations: operations, fileURL: imageURL)
-
-        print("步骤3: 提交截图...")
-        let commit = try await commitScreenshot(screenshotID: screenshotID, md5Hash: md5Hash)
-        let state = assetDeliveryState(from: (commit["data"] as? [String: Any])?["attributes"] as? [String: Any] ?? [:])
-        print("提交成功！")
-        print("最终状态: \(state)")
         if state == "UPLOAD_COMPLETE" || state == "COMPLETE" {
+            print("现有截图已是 \(state)，跳过上传")
             print("✅ 截图上传成功！")
-        } else {
-            print("⚠️  截图当前状态: \(state)")
+            return screenshotID
         }
-        return screenshotID
+
+        guard let operations = attributes["uploadOperations"] as? [[String: Any]], !operations.isEmpty else {
+            throw ScriptError("截图预留响应缺少 uploadOperations")
+        }
+        return try await finishScreenshotUpload(
+            screenshotID: screenshotID,
+            operations: operations,
+            imageURL: imageURL,
+            md5Hash: md5Hash
+        )
     }
 
     func createBatch(appID: String, products: [IAPProduct]) async -> [IAPResult] {
         var results: [IAPResult] = []
         for product in products {
+            var iapID: String?
             do {
-                print("创建内购项: \(product.productID) ($\(product.price))...")
-                let iapResponse = try await createInAppPurchase(appID: appID, productName: product.name, productID: product.productID)
-                guard let iapID = (iapResponse["data"] as? [String: Any])?["id"] as? String else {
-                    throw ScriptError("创建内购项成功但未返回 ID")
+                var isUpdate = false
+                if let existingID = try await findInAppPurchaseID(appID: appID, productID: product.productID) {
+                    iapID = existingID
+                    isUpdate = true
+                } else {
+                    print("创建内购项: \(product.productID) ($\(product.price))...")
+                    do {
+                        let iapResponse = try await createInAppPurchase(appID: appID, productName: product.name, productID: product.productID)
+                        guard let createdID = (iapResponse["data"] as? [String: Any])?["id"] as? String else {
+                            throw ScriptError("创建内购项成功但未返回 ID")
+                        }
+                        iapID = createdID
+                    } catch let error as APIHTTPError where error.statusCode == 409 {
+                        guard let existingID = try await findInAppPurchaseID(appID: appID, productID: product.productID) else {
+                            throw error
+                        }
+                        iapID = existingID
+                        isUpdate = true
+                    }
                 }
 
-                print("创建本地化信息...")
-                _ = try await createLocalization(
+                guard let iapID else {
+                    throw ScriptError("未获得内购项 ID")
+                }
+
+                if isUpdate {
+                    print("内购项已存在，按最新设置更新: \(product.productID) ($\(product.price))...")
+                    try await updateInAppPurchaseName(iapID: iapID, name: product.name)
+                }
+
+                try await upsertLocalization(
                     inAppPurchaseID: iapID,
                     displayName: product.displayName,
                     description: product.description,
                     locale: "en-US"
                 )
-
-                print("获取价格档位...")
-                let pricePointID = try await pricePointID(for: iapID, price: product.price)
-                if let pricePointID {
-                    print("设置价格档位...")
-                    _ = try await setPrice(iapID: iapID, pricePointID: pricePointID)
-                } else {
-                    print("⚠️  未找到 $\(product.price) 对应的美国区价格档位")
-                }
-
-                print("设置全球销售范围...")
-                try await setGlobalAvailability(iapID: iapID)
-
-                print("上传审核截图...")
-                let screenshotID = try await uploadScreenshot(inAppPurchaseID: iapID, imageURL: product.imageURL)
-
+                let (pricePointID, screenshotID) = try await applyPriceAvailabilityAndScreenshot(iapID: iapID, product: product)
                 results.append(
                     IAPResult(
                         productID: product.productID,
@@ -562,29 +611,147 @@ class AppStoreConnectAPI {
                         iapID: iapID,
                         pricePointID: pricePointID,
                         screenshotID: screenshotID,
-                        status: "success",
+                        status: isUpdate ? "updated" : "created",
                         error: nil
                     )
                 )
-                print("✅ \(product.productID) 内购项创建完成")
+                print("✅ \(product.productID) 内购项\(isUpdate ? "更新" : "创建")完成")
             } catch {
                 let message = errorMessage(error)
                 results.append(
                     IAPResult(
                         productID: product.productID,
                         price: product.price,
-                        iapID: nil,
+                        iapID: iapID,
                         pricePointID: nil,
                         screenshotID: nil,
                         status: "failed",
                         error: message
                     )
                 )
-                print("❌ \(product.productID) 内购项创建失败: \(message)")
+                print("❌ \(product.productID) 内购项处理失败: \(message)")
             }
             print("")
         }
         return results
+    }
+
+    private func findInAppPurchaseID(appID: String, productID: String) async throws -> String? {
+        let encoded = productID.addingPercentEncoding(withAllowedCharacters: CharacterSet.urlQueryAllowed.subtracting(CharacterSet(charactersIn: "&+="))) ?? productID
+        let response = try await apiRequest(
+            path: "/v1/apps/\(appID)/inAppPurchasesV2?filter[productId]=\(encoded)&limit=200",
+            method: "GET"
+        )
+        let items = response["data"] as? [[String: Any]] ?? []
+        return items.first(where: { item in
+            ((item["attributes"] as? [String: Any])?["productId"] as? String) == productID
+        })?["id"] as? String
+    }
+
+    private func updateInAppPurchaseName(iapID: String, name: String) async throws {
+        print("更新 Reference Name...")
+        let payload: [String: Any] = [
+            "data": [
+                "type": "inAppPurchases",
+                "id": iapID,
+                "attributes": [
+                    "name": name,
+                ],
+            ],
+        ]
+        _ = try await apiRequest(path: "/v2/inAppPurchases/\(iapID)", method: "PATCH", json: payload)
+    }
+
+    private func upsertLocalization(inAppPurchaseID: String, displayName: String, description: String, locale: String) async throws {
+        let response = try await apiRequest(
+            path: "/v2/inAppPurchases/\(inAppPurchaseID)/inAppPurchaseLocalizations?limit=200",
+            method: "GET"
+        )
+        let items = response["data"] as? [[String: Any]] ?? []
+        if let existingID = items.first(where: { item in
+            ((item["attributes"] as? [String: Any])?["locale"] as? String) == locale
+        })?["id"] as? String {
+            print("更新本地化信息 (\(locale))...")
+            let payload: [String: Any] = [
+                "data": [
+                    "type": "inAppPurchaseLocalizations",
+                    "id": existingID,
+                    "attributes": [
+                        "name": displayName,
+                        "description": description,
+                    ],
+                ],
+            ]
+            _ = try await apiRequest(path: "/v1/inAppPurchaseLocalizations/\(existingID)", method: "PATCH", json: payload)
+            return
+        }
+
+        print("创建本地化信息 (\(locale))...")
+        do {
+            _ = try await createLocalization(
+                inAppPurchaseID: inAppPurchaseID,
+                displayName: displayName,
+                description: description,
+                locale: locale
+            )
+        } catch let error as APIHTTPError where error.statusCode == 409 {
+            let retry = try await apiRequest(
+                path: "/v2/inAppPurchases/\(inAppPurchaseID)/inAppPurchaseLocalizations?limit=200",
+                method: "GET"
+            )
+            guard let existingID = (retry["data"] as? [[String: Any]] ?? []).first(where: { item in
+                ((item["attributes"] as? [String: Any])?["locale"] as? String) == locale
+            })?["id"] as? String else {
+                throw error
+            }
+            print("本地化已存在，改为更新 (\(locale))...")
+            let payload: [String: Any] = [
+                "data": [
+                    "type": "inAppPurchaseLocalizations",
+                    "id": existingID,
+                    "attributes": [
+                        "name": displayName,
+                        "description": description,
+                    ],
+                ],
+            ]
+            _ = try await apiRequest(path: "/v1/inAppPurchaseLocalizations/\(existingID)", method: "PATCH", json: payload)
+        }
+    }
+
+    private func applyPriceAvailabilityAndScreenshot(iapID: String, product: IAPProduct) async throws -> (String?, String) {
+        print("获取价格档位...")
+        let pricePointID = try await pricePointID(for: iapID, price: product.price)
+        if let pricePointID {
+            print("设置价格档位...")
+            _ = try await setPrice(iapID: iapID, pricePointID: pricePointID)
+        } else {
+            print("⚠️  未找到 $\(product.price) 对应的美国区价格档位")
+        }
+
+        print("设置全球销售范围...")
+        try await setGlobalAvailability(iapID: iapID)
+
+        print("上传审核截图...")
+        let screenshotID = try await uploadScreenshot(inAppPurchaseID: iapID, imageURL: product.imageURL)
+        return (pricePointID, screenshotID)
+    }
+
+    private func finishScreenshotUpload(screenshotID: String, operations: [[String: Any]], imageURL: URL, md5Hash: String) async throws -> String {
+        print("步骤2: 上传文件数据...")
+        try await uploadFileData(operations: operations, fileURL: imageURL)
+
+        print("步骤3: 提交截图...")
+        let commit = try await commitScreenshot(screenshotID: screenshotID, md5Hash: md5Hash)
+        let finalState = assetDeliveryState(from: (commit["data"] as? [String: Any])?["attributes"] as? [String: Any] ?? [:])
+        print("提交成功！")
+        print("最终状态: \(finalState)")
+        if finalState == "UPLOAD_COMPLETE" || finalState == "COMPLETE" {
+            print("✅ 截图上传成功！")
+        } else {
+            print("⚠️  截图当前状态: \(finalState)")
+        }
+        return screenshotID
     }
 
     private func allTerritories() async throws -> [String] {
@@ -617,7 +784,74 @@ class AppStoreConnectAPI {
                 ],
             ],
         ]
-        return try await apiRequest(path: "/v1/inAppPurchaseAppStoreReviewScreenshots", method: "POST", json: payload)
+
+        var attempt = 0
+        while true {
+            attempt += 1
+            do {
+                return try await apiRequest(
+                    path: "/v1/inAppPurchaseAppStoreReviewScreenshots",
+                    method: "POST",
+                    json: payload,
+                    retryServerErrors: false
+                )
+            } catch let error as APIHTTPError {
+                if let existing = try await fetchReviewScreenshot(inAppPurchaseID: inAppPurchaseID) {
+                    let attributes = (existing["data"] as? [String: Any])?["attributes"] as? [String: Any] ?? [:]
+                    let operations = attributes["uploadOperations"] as? [[String: Any]] ?? []
+                    let state = assetDeliveryState(from: attributes)
+                    if !operations.isEmpty || state == "UPLOAD_COMPLETE" || state == "COMPLETE" {
+                        print("⚠️  创建预留返回 HTTP \(error.statusCode)，但截图已存在，复用截图ID")
+                        return existing
+                    }
+                    if let screenshotID = (existing["data"] as? [String: Any])?["id"] as? String {
+                        print("现有截图不可用（状态: \(state)），删除后重新创建...")
+                        _ = try await apiRequest(path: "/v1/inAppPurchaseAppStoreReviewScreenshots/\(screenshotID)", method: "DELETE")
+                    }
+                }
+                if error.statusCode == 409 {
+                    throw ScriptError("截图已存在但无法读取现有资源: \(error.body)")
+                }
+                guard error.statusCode >= 500 || error.statusCode == 429 else {
+                    throw error
+                }
+                print("⚠️  API POST /v1/inAppPurchaseAppStoreReviewScreenshots HTTP \(error.statusCode)，2秒后重试 (第 \(attempt) 次)...")
+                print("Error response body: \(error.body)")
+                try await Task.sleep(nanoseconds: 2_000_000_000)
+            }
+        }
+    }
+
+    private func fetchReviewScreenshot(inAppPurchaseID: String) async throws -> [String: Any]? {
+        let paths = [
+            "/v2/inAppPurchases/\(inAppPurchaseID)/appStoreReviewScreenshot",
+            "/v1/inAppPurchases/\(inAppPurchaseID)/appStoreReviewScreenshot",
+        ]
+        var response: [String: Any]?
+        for path in paths {
+            do {
+                response = try await apiRequest(path: path, method: "GET")
+                break
+            } catch let error as APIHTTPError where error.statusCode == 404 {
+                continue
+            }
+        }
+        if response == nil {
+            let included = try await apiRequest(
+                path: "/v2/inAppPurchases/\(inAppPurchaseID)?include=appStoreReviewScreenshot",
+                method: "GET"
+            )
+            if let screenshots = included["included"] as? [[String: Any]],
+               let screenshot = screenshots.first(where: { $0["type"] as? String == "inAppPurchaseAppStoreReviewScreenshots" }) {
+                response = ["data": screenshot]
+            }
+        }
+        guard let response,
+              let data = response["data"] as? [String: Any],
+              data["id"] as? String != nil else {
+            return nil
+        }
+        return response
     }
 
     private func commitScreenshot(screenshotID: String, md5Hash: String) async throws -> [String: Any] {
@@ -663,7 +897,7 @@ class AppStoreConnectAPI {
         _ = try await sendRequest(request, label: "上传 \(url.host ?? url.absoluteString)")
     }
 
-    private func apiRequest(path: String, method: String, json: [String: Any]? = nil) async throws -> [String: Any] {
+    private func apiRequest(path: String, method: String, json: [String: Any]? = nil, retryServerErrors: Bool = true) async throws -> [String: Any] {
         guard let url = URL(string: baseURL + path) else {
             throw ScriptError("无效 URL: \(path)")
         }
@@ -675,14 +909,14 @@ class AppStoreConnectAPI {
             request.httpBody = try JSONSerialization.data(withJSONObject: json)
         }
 
-        let data = try await sendRequest(request, label: "API \(method) \(path)")
+        let data = try await sendRequest(request, label: "API \(method) \(path)", retryServerErrors: retryServerErrors)
         if data.isEmpty {
             return [:]
         }
         return try jsonObject(data)
     }
 
-    private func sendRequest(_ request: URLRequest, label: String) async throws -> Data {
+    private func sendRequest(_ request: URLRequest, label: String, retryServerErrors: Bool = true) async throws -> Data {
         var attempt = 0
         while true {
             attempt += 1
@@ -697,8 +931,17 @@ class AppStoreConnectAPI {
                     return data
                 }
                 let body = String(data: data, encoding: .utf8) ?? ""
+                let error = APIHTTPError(statusCode: http.statusCode, data: data)
+                let shouldRetry = http.statusCode == 429 || (retryServerErrors && http.statusCode >= 500)
+                if !shouldRetry {
+                    print("⚠️  \(label) HTTP \(http.statusCode)")
+                    print("Error response body: \(body)")
+                    throw error
+                }
                 print("⚠️  \(label) HTTP \(http.statusCode)，2秒后重试 (第 \(attempt) 次)...")
                 print("Error response body: \(body)")
+            } catch let error as APIHTTPError {
+                throw error
             } catch {
                 print("⚠️  \(label) 请求失败: \(errorMessage(error))，2秒后重试 (第 \(attempt) 次)...")
             }
@@ -754,19 +997,24 @@ func loadConfig(from url: URL) throws -> IAPConfig {
 }
 
 func printResults(_ results: [IAPResult]) {
-    print("🎉 内购项创建完成！")
+    print("🎉 内购项处理完成！")
     print("📊 结果统计:")
-    let success = results.filter { $0.status == "success" }
+    let created = results.filter { $0.status == "created" }
+    let updated = results.filter { $0.status == "updated" }
     let failed = results.filter { $0.status == "failed" }
 
-    print("✅ 成功: \(success.count) 个")
-    for result in success {
-        print("  - $\(result.price): \(result.productID) (ID: \(result.iapID ?? ""))")
+    func printSuccess(_ result: IAPResult, prefix: String) {
+        print("  - \(prefix)$\(result.price): \(result.productID) (ID: \(result.iapID ?? ""))")
         if let pricePointID = result.pricePointID {
             print("    价格档位ID: \(pricePointID)")
         }
         print("    📸 截图ID: \(result.screenshotID ?? "")")
     }
+
+    print("✅ 新建: \(created.count) 个")
+    created.forEach { printSuccess($0, prefix: "") }
+    print("🔄 更新: \(updated.count) 个")
+    updated.forEach { printSuccess($0, prefix: "") }
 
     print("❌ 失败: \(failed.count) 个")
     for result in failed {
@@ -777,7 +1025,7 @@ func printResults(_ results: [IAPResult]) {
 }
 
 func run() async throws {
-    print("App Store Connect API - 内购项批量创建工具")
+    print("App Store Connect API - 内购项批量创建/更新工具")
     print("")
 
     let directory = scriptDirectoryURL()
@@ -800,13 +1048,13 @@ func run() async throws {
         return
     }
 
-    guard confirm("请确认以上信息无误。输入 y 开始创建，其他输入取消：") else {
+    guard confirm("请确认以上信息无误。已存在的内购项会按 CSV 更新。输入 y 开始，其他输入取消：") else {
         print("已取消")
         return
     }
 
     print("")
-    print("🚀 开始批量创建内购项...")
+    print("🚀 开始批量创建/更新内购项...")
     print("")
 
     let api = AppStoreConnectAPI(keyID: config.keyID, issuerID: config.issuerID, privateKeyURL: privateKeyURL)
